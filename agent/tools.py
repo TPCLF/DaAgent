@@ -1,6 +1,7 @@
 import os
 import subprocess
 import difflib
+import json
 from typing import List, Optional, Tuple
 from pathlib import Path
 from rich.console import Console
@@ -39,7 +40,7 @@ class ToolRegistry:
             for f in sorted(files):
                 is_dir = (target / f).is_dir()
                 output.append(f"{f}{'/' if is_dir else ''}")
-            return "\n".join(output)
+            return "\\n".join(output)
         except Exception as e:
             return f"Error listing {path}: {str(e)}"
 
@@ -89,26 +90,13 @@ class ToolRegistry:
         try:
             original = target.read_text(encoding='utf-8').splitlines(keepends=True)
             
-            # Simple patching logic
-            # We expect the diff to be a standard python difflib unified_diff format or partial
-            # This is complex to get right for LLMs. 
-            # Strategy: The LLM should provide search/replace blocks or we use a library.
-            # For this simple v1 implementation, we will try to parse a simplified Search/Replace block 
-            # OR standard Unified Diff.
-            
-            # Let's support a simple Search/Replace block format for robustness with small models
-            # FORMAT:
-            # <<<<<<< SEARCH
-            # old lines
-            # =======
-            # new lines
-            # >>>>>>> REPLACE
-            
-            if "<<<<<<< SEARCH" in diff_content:
+            # Use regex to just find the blocks, ignore exact marker count/spacing in pre-check
+            import re
+            # Match roughly <<<< SEARCH ... ==== ... >>>> REPLACE
+            # We use this check to trigger the block parser
+            if re.search(r'<{3,}\s*SEARCH', diff_content):
                 return self._apply_search_replace(target, original, diff_content)
             
-            # Fallback to standard patching (implementation details omitted for brevity in this snippet, 
-            # ideally would use `patch` command or python `whatthepatch` lib if added)
             return "Error: Please use the <<<<<<< SEARCH / ======= / >>>>>>> REPLACE format for edits."
 
         except Exception as e:
@@ -116,29 +104,89 @@ class ToolRegistry:
     
     def _apply_search_replace(self, target: Path, original_lines: List[str], diff_content: str) -> str:
         """
-        Applies a Search/Replace block. 
-        This is robust for LLMs that struggle with exact line numbers in unified diffs.
+        Applies a Search/Replace block with valid whitespace matching and robust parsing.
         """
-        # Parse blocks
         import re
-        pattern = re.compile(r'<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE', re.DOTALL)
+        # Robust regex:
+        # 1. <{3,} allows 3 or more <
+        # 2. \s* allows spaces before SEARCH
+        # 3. (?: .*)? allows trailing text on marker line
+        # 4. \s* after marker consumes newline
+        pattern = re.compile(
+            r'<{3,}\s*SEARCH(?:[^\n]*)\n(.*?)\n={3,}(?:[^\n]*)\n(.*?)\n>{3,}\s*REPLACE', 
+            re.DOTALL
+        )
         match = pattern.search(diff_content)
         
         if not match:
-            return "Error: Invalid Search/Replace format."
+            # Fallback for when there is NO newline after markers (rare but happens)
+            # Try looser match
+            pattern_loose = re.compile(
+                r'<{3,}\s*SEARCH.*?\n(.*?)\n={3,}.*?\n(.*?)\n>{3,}\s*REPLACE', 
+                re.DOTALL
+            )
+            match = pattern_loose.search(diff_content)
+
+        if not match:
+             return "Error: Invalid Search/Replace format. Ensure you have the headers exactly."
         
         search_block = match.group(1)
         replace_block = match.group(2)
         
         original_text = "".join(original_lines)
         
-        if search_block not in original_text:
-            # Try to be a bit fuzzy? No, safety first.
-            return "Error: Search block not found in file. Ensure exact match."
+        # 1. Try exact match
+        if search_block in original_text:
+            new_text = original_text.replace(search_block, replace_block, 1)
+            target.write_text(new_text, encoding='utf-8')
+            return "Successfully applied edit (exact match)."
+
+        # 2. Try normalized whitespace match
+        def normalize(text):
+            return "\\n".join([line.strip() for line in text.splitlines() if line.strip()])
             
-        new_text = original_text.replace(search_block, replace_block, 1) # Only replace first occurrence
-        target.write_text(new_text, encoding='utf-8')
-        return "Successfully applied edit."
+        norm_search = normalize(search_block)
+        
+        src_lines = [line.strip() for line in original_lines]
+        search_lines = [line.strip() for line in search_block.splitlines()]
+        search_lines_no_empty = [l for l in search_lines if l]
+        
+        if not search_lines_no_empty:
+             return "Error: Search block is empty or only whitespace."
+
+        found_at_line = -1
+        n_search = len(search_lines)
+        
+        # Heuristic: try to align the stripped search block with stripped source lines
+        # We need to match the sequence of search_lines (which includes empty lines? no, let's match non-empty)
+        # Actually, let's stick to the sliding window of exact lines (stripped) we used before
+        # But we must be careful about whether search_lines includes the empty ones.
+        
+        # If search block has:
+        # Line A
+        #
+        # Line B
+        #
+        # It's safest to match that exact sequence of (A, empty, B).
+        
+        for i in range(len(src_lines) - n_search + 1):
+             window = src_lines[i:i+n_search]
+             if window == search_lines:
+                 found_at_line = i
+                 break
+        
+        if found_at_line != -1:
+             prefix = original_lines[:found_at_line]
+             # We need to know how many lines to replace in ORIGINAL. 
+             # n_search is just the number of lines in search block. 
+             # Does it map 1:1 to original lines? Yes, because we mapped src_lines 1:1.
+             suffix = original_lines[found_at_line+n_search:]
+             
+             new_content = "".join(prefix) + replace_block + "\\n" + "".join(suffix)
+             target.write_text(new_content, encoding='utf-8')
+             return "Successfully applied edit (whitespace-relaxed match)."
+
+        return "Error: Search block not found in file. Ensure exact match (or check your indentation)."
 
     def run_command(self, command: str) -> str:
         """Run a shell command."""
@@ -155,11 +203,11 @@ class ToolRegistry:
             stderr = result.stderr
             return_code = result.returncode
             
-            output = f"Exit Code: {return_code}\n"
+            output = f"Exit Code: {return_code}\\n"
             if stdout:
-                output += f"STDOUT:\n{stdout}\n"
+                output += f"STDOUT:\\n{stdout}\\n"
             if stderr:
-                output += f"STDERR:\n{stderr}\n"
+                output += f"STDERR:\\n{stderr}\\n"
             return output
         except subprocess.TimeoutExpired:
             return "Error: Command timed out."
@@ -169,3 +217,59 @@ class ToolRegistry:
     def grep_files(self, pattern: str, path: str = ".") -> str:
         """Recursive search for text."""
         return self.run_command(f"grep -r '{pattern}' {path}")
+
+    def search_web(self, query: str) -> str:
+        """Search the internet for documentation or help using ddgr (CMD line)."""
+        if not query or not query.strip():
+            return "Error: Empty search query."
+
+        # Check if ddgr is installed
+        check = subprocess.run("which ddgr", shell=True, capture_output=True, text=True)
+        if check.returncode != 0:
+             user_bin = os.path.expanduser("~/.local/bin/ddgr")
+             if os.path.exists(user_bin):
+                 cmd_base = user_bin
+             else:
+                return "Error: `ddgr` tool not found. Please install it with `pip install --user ddgr`."
+        else:
+            cmd_base = "ddgr"
+
+        try:
+            # -n 3: 3 results
+            # --json: json output
+            # --unsafe: might help with some blocks? No, let's keep it safe.
+            # Use valid header to avoiding blocking? ddgr handles this usually.
+            command = [cmd_base, "--json", "-n", "3", query]
+            result = subprocess.run(
+                command, 
+                capture_output=True, 
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode != 0:
+                # If ddgr returns non-zero, it might be connectivity or no results handling difference
+                if "No results" in result.stderr or not result.stderr.strip():
+                     return "No results found (or search failed silentley)."
+                return f"Error searching web: {result.stderr}"
+            
+            if not result.stdout.strip():
+                 return "No results found."
+
+            data = json.loads(result.stdout)
+            if not data:
+                return "No results found."
+            
+            output = [f"Search Results for '{query}':"]
+            for r in data:
+                title = r.get('title', 'No Title')
+                url = r.get('url', 'No URL')
+                snippet = r.get('abstract', '')
+                output.append(f"- {title}: {url}\\n  {snippet}")
+            return "\\n".join(output)
+            
+        except json.JSONDecodeError:
+            # If ddgr returns non-JSON text (sometimes happens on error), return raw
+            return f"Error parsing search results. Raw output: {result.stdout[:500]}..."
+        except Exception as e:
+            return f"Error searching web: {str(e)}"

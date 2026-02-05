@@ -23,30 +23,43 @@ def parse_llm_action(response_text: str) -> Tuple[Optional[str], Optional[str], 
         if line.startswith("TOOL:"):
             tool = line.split(":", 1)[1].strip()
             # Look ahead for args
+            # Look ahead for args
             if i + 1 < len(lines) and lines[i+1].startswith("ARG1:"):
                 arg1 = lines[i+1].split(":", 1)[1].strip()
                 # Check for continuation of ARG1 (multiline)
                 j = i + 2
                 while j < len(lines) and not lines[j].startswith("ARG2:") and not lines[j].startswith("TOOL:"):
+                     # Special case for edit_file: if we see the start of a diff block, it's ARG2
+                     if tool == "edit_file" and lines[j].startswith("<<<<<<< SEARCH"):
+                         break
+                     
                      # It's part of ARG1 if it's not a keyword
                      arg1 += "\n" + lines[j]
                      j += 1
                 
                 # Check for ARG2
-                if j < len(lines) and lines[j].startswith("ARG2:"):
-                    arg2 = lines[j].split(":", 1)[1].strip()
-                    # continuation for ARG2
-                    k = j + 1
-                    while k < len(lines) and not lines[k].startswith("TOOL:"):
-                        arg2 += "\n" + lines[k]
-                        k += 1
+                if j < len(lines):
+                    if lines[j].startswith("ARG2:"):
+                        arg2 = lines[j].split(":", 1)[1].strip()
+                        # continuation for ARG2
+                        k = j + 1
+                        while k < len(lines) and not lines[k].startswith("TOOL:"):
+                            arg2 += "\n" + lines[k]
+                            k += 1
+                    elif tool == "edit_file" and lines[j].startswith("<<<<<<< SEARCH"):
+                        # Implicit ARG2 start for edit_file
+                        arg2 = lines[j]
+                        k = j + 1
+                        while k < len(lines) and not lines[k].startswith("TOOL:"):
+                            arg2 += "\n" + lines[k]
+                            k += 1
     
     return tool, arg1, arg2
 
 def build_system_prompt(work_dir: str) -> str:
     return f"""You are a Local CLI Coding Agent working in {work_dir}.
 You must strictly follow this cycle:
-1. THINK: Analyze the situation.
+1. THINK: Analyze the situation. (Use 'search_web' to verify documentation or syntax if unsure)
 2. ACT: Call a tool using the format below.
 
 TOOLS AVAILABLE:
@@ -56,6 +69,7 @@ TOOLS AVAILABLE:
 - edit_file (ARG1: path, ARG2: Search/Replace Block)
 - run_command (ARG1: shell command)
 - grep_files (ARG1: pattern)
+- search_web (ARG1: query)
 
 FORMATTING:
 To call a tool, end your message with:

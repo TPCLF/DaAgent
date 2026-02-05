@@ -5,7 +5,7 @@ class AgentConfig(BaseModel):
     """Configuration for the CLI Agent."""
     
     # Model Settings
-    model: str = Field(default="llama3.1", description="Name of the model to use (e.g. llama3, mistral)")
+    model: str = Field(default="phi4:latest", description="Name of the model to use (e.g. llama3, mistral)")
     api_base: str = Field(default="http://localhost:11434/v1", description="Base URL for the OpenAI-compatible API")
     api_key: str = Field(default="ollama", description="API Key (dummy for Ollama)")
     temperature: float = Field(default=0.0, description="Sampling temperature")
@@ -22,8 +22,11 @@ class AgentConfig(BaseModel):
     @staticmethod
     def from_env() -> "AgentConfig":
         """Load config from environment variables."""
+        saved_model = AgentConfig.load_saved_model()
+        default_model = saved_model if saved_model else "llama3.1"
+        
         return AgentConfig(
-            model=os.getenv("AGENT_MODEL", "llama3.1"),
+            model=os.getenv("AGENT_MODEL", default_model),
             api_base=os.getenv("AGENT_API_BASE", "http://localhost:11434/v1"),
             api_key=os.getenv("AGENT_API_KEY", "ollama"),
             temperature=float(os.getenv("AGENT_TEMPERATURE", "0.0")),
@@ -32,3 +35,25 @@ class AgentConfig(BaseModel):
             confirm_dangerous=os.getenv("AGENT_CONFIRM", "true").lower() == "true",
             diff_only=os.getenv("AGENT_DIFF_ONLY", "false").lower() == "true",
         )
+
+    def save_model(self, model_name: str):
+        """Save the selected model to a local config file."""
+        self.model = model_name
+        config_path = os.path.join(os.getcwd(), ".agent_model")
+        try:
+            with open(config_path, "w") as f:
+                f.write(model_name.strip())
+        except Exception as e:
+            print(f"Warning: Could not save model preference: {e}")
+
+    @staticmethod
+    def load_saved_model() -> str | None:
+        """Load the saved model from a local config file."""
+        config_path = os.path.join(os.getcwd(), ".agent_model")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r") as f:
+                    return f.read().strip()
+            except:
+                pass
+        return None

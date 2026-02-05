@@ -46,3 +46,18 @@ class LLMClient:
             return True
         except Exception:
             return False
+
+    def list_models(self) -> List[str]:
+        """List available models from the provider."""
+        try:
+            response = self.client.get("/models")
+            response.raise_for_status()
+            data = response.json()
+            # Handle standard OpenAI/Ollama format
+            if "data" in data:
+                return [m["id"] for m in data["data"]]
+            # Fallback or other formats could be handled here
+            return []
+        except Exception as e:
+            console.print(f"[bold red]Error listing models:[/bold red] {e}")
+            return []
